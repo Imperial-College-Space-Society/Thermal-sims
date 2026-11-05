@@ -1,0 +1,526 @@
+#Initial stess solver
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep 22 09:23:18 2026
+
+@author: jamessquire
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import ezdxf
+from scipy.optimize import curve_fit
+from scipy.interpolate import PchipInterpolator
+plt.style.use("seaborn-v0_8-whitegrid")
+
+##Engine parameters
+P_c = 3e6   #chamber pressure (Pa)
+stiffness = 0.2  #Injector stiffness as a fraction of chamber pressure 
+t = 0.7e-3      #Chamber all thickness (m)
+t_outer = 2e-3  #outer engine wall thickness
+m_dot = 0.5        #Coolant mass flow rate (kg/s)
+N = 1000         #Chosen number of analysis segments 
+gamma = np.array([1.2511, 1.2513, 1.2604, 1.2710])       #ratio of spesific heats, given on CEA
+
+
+#RPA data
+with open('ICSS_RPA_test.txt', 'r') as raw_file:   #reading thermal file
+    lines = raw_file.readlines()
+
+
+start_line = 10                       #first line in the file which is data, line index 10 when there is a title and 8 for no title 
+n_data = 13              #number of pieces of information given per line (different temps, ppressures, etc...)
+n_segments = len(lines)-start_line-1               #number of analysis segments that the chamber is split up into axially, it is spesifed on RPA as well (-1 is used to ignore the last line, which isn't data)
+
+data = np.zeros((n_segments, 13)) #creating the empty final data set 
+
+for i in range(n_segments):           #filling the data set, such that data[i,j] refers to the j type of data (temps, q, etc...) in the i row/axial segment
+        values = lines[i+start_line].split()
+        for j in range(n_data):
+            data[i,j] = values[j]
+
+
+#Extracting data 
+x_data = data[:,0] * 1e-3
+heat_flux = data[:,5] * 1e3  #given in kW/m^2 so converted to W/m^2
+hot_wall_temp = data[:,6]
+cold_wall_temp = data[:,8]
+coolant_temp = data[:,9]
+avg_wall_temp = (cold_wall_temp + hot_wall_temp)/2
+
+
+##Chamber geometry
+raw_geometry = ezdxf.readfile('ICSS_RPA_test.dxf')  #reading dxf chamber geometry file 
+msp = raw_geometry.modelspace()
+
+
+def arc_orientation(a):
+    if a.dxf.start_angle < 180:
+        return 'frown'
+    elif a.dxf.start_angle >= 180:
+        return 'smile'
+        
+        
+def start_of_segment(a):
+    
+    if a.dxftype() == 'LINE':
+        return a.dxf.start.x 
+    
+    elif a.dxftype() == 'ARC':
+        if arc_orientation(a) == 'smile':
+            return a.start_point[0]
+        elif arc_orientation(a) == 'frown':
+            return a.end_point[0]
+    
+    elif a.dxftype() == 'SPLINE':
+        return a.control_points[0,0]
+    
+    
+def end_of_segment(a):
+    
+    if a.dxftype() == 'LINE':
+        return a.dxf.end.x 
+    
+    elif a.dxftype() == 'ARC':
+        if arc_orientation(a) == 'smile':
+            return a.end_point[0]
+        elif arc_orientation(a) == 'frown':
+            return a.start_point[0]
+    
+    elif a.dxftype() == 'SPLINE':
+        return a.control_points[2,0]
+    
+    
+def func(a, x):        #creates cartisian functions from model space values
+    
+    if a.dxftype() == 'LINE':
+        x1, y1 = a.dxf.start.x, a.dxf.start.y
+        x2, y2 = a.dxf.end.x, a.dxf.end.y
+        m = (y2-y1)/(x2-x1)
+        c = y1-m*x1
+        return m*x+c
+    
+    elif a.dxftype() == 'ARC':
+        x_c, y_c, r = a.dxf.center.x, a.dxf.center.y, a.dxf.radius
+        if arc_orientation(a) == 'smile':
+            return y_c - np.sqrt(r**2-(x-x_c)**2)
+        elif arc_orientation(a) == 'frown':
+            return y_c + np.sqrt(r**2-(x-x_c)**2)
+    
+    elif a.dxftype() == 'SPLINE':
+        P_0x, P_0y = a.control_points[0,0], a.control_points[0,1]
+        P_1x, P_1y = a.control_points[1,0], a.control_points[1,1]
+        P_2x, P_2y = a.control_points[2,0], a.control_points[2,1]
+        Ax, Ay = P_0x-2*P_1x+P_2x, P_0y-2*P_1y+P_2y
+        Bx, By = 2*(P_1x-P_0x), 2*(P_1y-P_0y)
+        Cx, Cy = P_0x, P_0y
+        t = (-Bx+np.sqrt(Bx**2-4*Ax*(Cx-x)))/(2*Ax)
+        return Ay*t**2+By*t+Cy
+
+#actual chamber geometry function
+def chamber_radius(msp, x):
+    if start_of_segment(msp[0]) <= x <= end_of_segment(msp[-1]):          #defining the function's range (chamber length)
+        for i in range(len(msp)-1):                         #all segments but the last which is a straight line at 0 all the way along the chamber lentgh
+            if start_of_segment(msp[i]) <= x <= end_of_segment(msp[i]):
+                return func(msp[i], x)
+            else:
+                continue 
+    else:
+        return 0 
+
+
+r_vals = np.array(())
+x_vals = np.linspace(start_of_segment(msp[0]), end_of_segment(msp[-1]), N) * 1e-3     
+for i in range(N):
+    r_vals = np.append(r_vals, chamber_radius(msp, x_vals[i]*1e3))     #although x_vals needs to be in m to be constistent with x_data and the rest of the code in SI units, the DXF is in mm i think so e3 is used here 
+r_vals = r_vals * 1e-3  #converting to m
+
+#plotting chamber geometry
+plt.plot(x_vals, r_vals)
+plt.ylim(ymax=0.1, ymin=-0.04)
+plt.title('Chamber geometry')
+plt.ylabel('Chamber radius (m)')
+plt.xlabel('axial distance from injector (m)')
+
+
+
+##Engine material properties 
+Al_Cu = 1   #1 for AlSi10Mg, 2 for CuCrZr
+
+if Al_Cu == 1:    
+    E = np.array([69, 67, 62, 53, 41]) * 1e9   #Modulus of elasticity (Pa)
+    T_E = np.array([293.15, 373.15, 473.15, 573.15, 673.15])   #Modulus of elasticity temprature range (K)
+    poisson = 0.33   #Poisson's ratio
+    a = 22e-6   #Coeficent of thermal expntion (K^-1)
+    k = 150  #Thermal conductivity (Wm^-1K^-1)
+    YS = np.array([204, 198, 181, 182, 158, 132, 70, 30, 12]) * 1e6   #yeild stress at increasing tmeps (Pa)
+    T_YS = np.array([298, 323, 373, 423, 473, 523, 573, 623, 673])    #temps assosiated with yeild stresses 
+    eps = 20e-6    #surface roughness (m) 
+    
+elif Al_Cu == 2: 
+    E = np.array([]) * 1e9  
+    T_E = np.array([])   
+    poisson = 0.33   
+    a = 17e-6   
+    k = 340  
+    YS = np.array([]) * 1e6   
+    T_YS = np.array([])    
+    eps = 20e-6      
+
+
+##Coolant properties 
+IPA_ethanol = 1   #1 for IPA, 2 for ethanol
+
+if IPA_ethanol == 1:
+    mu = np.array([2.554, 1.427, 0.881, 0.578]) * 1e-3      #Coolant dynamic viscosity (Pa.s)
+    T_mu = np.array([293.15, 313.15, 333.15, 353.15]) #Coolant dynamic viscosity temprature range (K)
+    rho = np.array([790.53, 773.74, 755.60, 735.65, 724.88, 713.53])   #coolant density (kg/m^3)   
+    T_rho = np.array([293.15, 313.15, 333.15, 353.15, 363.15, 373.15]) #coolant density temprature range (K)
+    
+    
+elif IPA_ethanol == 2:  
+    rho = np.array([])      
+    T_rho = np.array([278.15, 283.15, 288.15, 293.15, 298.15, 303.15, 308.15, 313.15, 318.15, 323.15, 328.15, 333.15, 338.15, 343.15, 348.15, 353.15])     
+    #mu for ethanol is defined in the function below as it was given as a modeled function rather than table of values 
+    T_mu = np.linspace(273.15, 353.15, 100)
+
+
+
+
+##Fits and resulting composite functions for interpolation and extrapolation of material properties 
+def quadratic(x, a, b, c):
+    return a*x**2 + b*x + c 
+
+def exp(x, A, B, C):
+    return  A*np.exp(-B*x) + C 
+
+#cropping YS so just to fit it at high temps
+if Al_Cu == 1:
+    n_crop = 4      #number of points at the end of the T_YS array you want to fit to
+elif Al_Cu == 2:
+    n_crop = 4
+    
+YS_crop = np.array([])
+T_YS_crop = np.array([])
+for i in range(n_crop):
+    YS_crop = np.append(YS_crop, YS[-n_crop+i])
+    T_YS_crop = np.append(T_YS_crop, T_YS[-n_crop+i])
+
+
+#inital guesses for yeild stress, modulus of elasticity and rho fits
+p0_YS = [6.4e11, 0.016, 0]
+p0_E = [-1.7e5, 9.1e7, 5.7e10]
+p0_rho = [-2.2e-3, 0.52, 829]
+
+#fitting
+p_YS, cov_YS = curve_fit(exp, T_YS_crop, YS_crop, p0_YS) 
+p_E, cov_E = curve_fit(quadratic, T_E, E, p0_E) 
+p_rho, cov_rho = curve_fit(quadratic, T_rho, rho, p0_rho)
+
+#extracting fitted parameters 
+A_YS, B_YS, C_YS = p_YS
+a_E, b_E, c_E = p_E
+a_rho, b_rho, c_rho = p_rho
+
+
+#making the function for E and rho and the composite function for YS 
+def f_E(T):
+    return quadratic(T, a_E, b_E, c_E)
+
+def f_rho(T):
+    return quadratic(T, a_rho, b_rho, c_rho)
+    
+def f_YS(T):
+    if T > T_YS[-1]:
+        return YS[-1] + -B_YS*A_YS*np.exp(-B_YS*T_YS[-1]) * (T-T_YS[-1])   #Linear extrapolation of YS from the last data point using the gradient of the exponenetial fit
+    for i in range(len(YS)-1):
+        if T_YS[i] <= T <= T_YS[i+1]:
+            m = (YS[i+1]-YS[i])/(T_YS[i+1]-T_YS[i])
+            return YS[i] + m*(T-T_YS[i])
+        
+
+#fitting and making functions for mu 
+if IPA_ethanol == 1:  
+    p0_mu = [3.4, 0.0247, 0]
+    p_mu, cov_mu = curve_fit(exp, T_mu, mu, p0_mu)
+    A_mu, B_mu, C_mu = p_mu 
+    
+    def f_mu(T):
+        return exp(T, A_mu, B_mu, C_mu)
+    
+elif IPA_ethanol == 2:  
+    def f_mu(T):
+        return (6.672049e5 + 4*5.849096e3)/(3.939452e3 - 22.18176*T + 1.241880e-4*T**3 + 4) * 1e-6
+
+
+
+#plotting all properties and superposed fits 
+T_mu_test = np.linspace(T_mu[0], T_mu[-1], 100)
+plt.figure()
+plt.plot(T_mu, f_mu(T_mu))
+plt.plot(T_mu_test, f_mu(T_mu_test))
+plt.title('mu')
+plt.ylabel('Coolant dynamic viscosity (Pa.s)')
+plt.xlabel('T (K)')
+
+T_rho_test = np.linspace(T_rho[0], T_rho[-1], 100)
+plt.figure()
+plt.plot(T_rho, rho)
+plt.plot(T_rho_test, f_rho(T_rho_test))
+plt.title('rho')
+plt.ylabel('coolant density (kg/m^3) ')
+plt.xlabel('T(K)')
+
+T_E_test = np.linspace(T_E[0], T_E[-1], N)
+plt.figure()
+plt.plot(T_E, E)
+plt.plot(T_E_test, f_E(T_E_test))
+plt.title('E')
+plt.ylabel('Modulus of elasticity (Pa)')
+plt.xlabel('T(K)')
+
+YS_crop_test_1 = []   #to show the interpolation and extrapolation
+YS_crop_test_2 = []   #just to show the exponential fit, although it is never actually used explicitly
+T_YS_crop_test = np.linspace(T_YS_crop[0], T_YS_crop[-1]+40, 1000)
+for i in T_YS_crop_test:
+    YS_crop_test_1 = np.append(YS_crop_test_1, f_YS(i))
+    YS_crop_test_2 = np.append(YS_crop_test_2, exp(i, A_YS, B_YS, C_YS))
+plt.figure()
+plt.plot(T_YS, YS)
+plt.plot(T_YS_crop_test, YS_crop_test_1)
+plt.plot(T_YS_crop_test, YS_crop_test_2)
+plt.title('YS')
+plt.ylabel('yeild stress (Pa)')
+plt.xlabel('T(K)')
+
+
+
+##Interpolation of RPA data
+f_hot_wall_temp = PchipInterpolator(x_data, hot_wall_temp, extrapolate=False)
+f_cold_wall_temp = PchipInterpolator(x_data, cold_wall_temp, extrapolate=False)
+f_avg_wall_temp = PchipInterpolator(x_data, avg_wall_temp, extrapolate=False)
+f_coolant_temp = PchipInterpolator(x_data, coolant_temp, extrapolate=False)
+f_heat_flux = PchipInterpolator(x_data, heat_flux, extrapolate=False)
+
+#creating arrays of interpolated RPA values with N segments 
+int_hot_wall_temp = f_hot_wall_temp(x_vals)
+int_cold_wall_temp = f_cold_wall_temp(x_vals)
+int_avg_wall_temp = f_avg_wall_temp(x_vals)
+int_coolant_temp = f_coolant_temp(x_vals)
+int_heat_flux = f_heat_flux(x_vals)
+dT_c = int_cold_wall_temp - np.full(N, 273.15)     #array of temp above ambient of cold_wall_temp 
+
+#plotting interpolated RPA data
+plt.figure()
+plt.plot(x_vals, int_avg_wall_temp)
+plt.plot(x_data, avg_wall_temp)
+plt.title('RPA avg_wall_temp')
+plt.ylabel('avg_wall_temp (T)')
+plt.xlabel('axial distance from injector (m)')
+
+plt.figure()
+plt.plot(x_vals, int_coolant_temp)
+plt.plot(x_data, coolant_temp)
+plt.title('coolant_temp')
+plt.ylabel('RPA coolant_temp (T)')
+plt.xlabel('axial distance from injector (m)')
+
+plt.figure()
+plt.plot(x_vals, int_heat_flux)
+plt.plot(x_data, heat_flux)
+plt.title('RPA total heat_flux')
+plt.ylabel('heat_flux (W/m^2)')
+plt.xlabel('axial distance from injector (m)')
+
+plt.show()
+
+
+
+##Regen chanel definition 
+channel_type = 1   #1 is rib width defined and 2 is angle defined 
+alpha = 0/360 * 2*np.pi       #Helical angle (enter in ˚, converted to rad)
+n_channels = 60    #number of regen channels 
+h_channels = 1e-3  #regen channel hight (m)
+fillet_radius = 0.5e-3   #fillet radius on regen channels (m)
+
+rib_width = 1e-3   #constant rib width (used for channel_type = 1 ONLY) (in m)
+channel_angle = 3/360 * 2*np.pi  #constant channel angle (used for channel_type = 2 ONLY) (enter in ˚, converted to rad)
+
+#creating array of avg and lower regen channel widths, with N segments
+if channel_type == 1:
+    avg_regen_widths = (2*np.pi*(r_vals+t+h_channels/2) - n_channels * rib_width/(np.cos(alpha)))/n_channels 
+    lower_regen_widths = (2*np.pi*(r_vals+t) - n_channels * rib_width/(np.cos(alpha)))/n_channels 
+    
+elif channel_type == 2:
+    avg_regen_widths = channel_angle * (r_vals + t + h_channels/2) 
+    lower_regen_widths = channel_angle * (r_vals + t) 
+
+
+
+##Pressure drop calculator (using Darcy-Wiesbach only)
+A = h_channels * avg_regen_widths - (4*fillet_radius**2 - np.pi*fillet_radius**2)  #individual channel area (m^2)
+int_rho = f_rho(int_coolant_temp)    #array of coolant densities along the regen channels (N segments) (in kg/m^3), using the rho interpolation/extrapolation function and interpolated RPA coolant temps
+Q = np.full(N, m_dot/n_channels) / int_rho      #array of volumetric flow rate along the regen channels (N segments) (in m^3/s)
+v = Q / A   #regen channel coolant velocits (N segmented array)
+D_eff = 4*A/(2*h_channels + 2*avg_regen_widths - 8*fillet_radius + 2*np.pi*fillet_radius)    #effective regen channel pipe diameter (m)
+int_mu = f_mu(int_coolant_temp)    #interpolated dynamic viscosity values, from interpolated RPA coolant temps (N segment array)
+Re = (int_rho * v * D_eff)/int_mu  #Reynolds number along regen channels (N segment array)
+f =  1/(-1.8*np.log10((np.full(N, eps)/(3.7*D_eff))**1.11 + 6.9/Re))**2         #friction factor estimated through the closed form Haaland Equation
+
+#major (Darcy-Weisbach) pressure loss
+dP = 0
+p_regen = np.array([])
+for i in range(N):
+    L = (x_vals[1]-x_vals[0])/np.cos(alpha) 
+    dP += f[i] * (L/D_eff[i]) * (int_rho[i]*v[i]**2)/2
+    p_regen = np.append(p_regen, P_c+dP+stiffness*P_c)
+
+#throat pressure (the pressure that RPA will then be re-run on)
+throat_index = np.argmin(r_vals)
+P_throat = p_regen[throat_index]
+
+print('Regen pressure loss', dP*1e-5, 'Bar')
+print('Throat Pressure', P_throat*1e-5, 'Bar')
+
+#check to make sure that Re and eps/D_eff are withing the range of the Haaland equation (4000<Re<10^8 and 10^-6 < eps/D_eff < 0.05, although the low range of Re doesn't matter too much as it is only for a short region at the end of the nozzle)
+print('eps/D_eff range:', eps/max(D_eff), 'to', eps/min(D_eff))
+print('Re range:', max(Re), 'to', min(Re)) 
+
+
+
+##Thermal stress analysis
+
+#finding static pressures 
+AR = np.pi*r_vals**2 / np.full(N, np.pi*min(r_vals)**2)      #N segment array of area ratios
+
+gamma_positions = np.array([x_vals[0], end_of_segment(msp[0])*1e-3, end_of_segment(msp[3])*1e-3, x_vals[-1]])   #positions of the injector, start of converging section, throat and end of nozzle (positions where gamma is given on CEA)
+gamma_int = np.interp(x_vals, gamma_positions, gamma)     #linear interpolation of gamma fro each value of x_vals
+
+def fM(AR, M, gamma):
+    return AR**2 - 1/M**2 * (2/(gamma+1) * (1 + (gamma-1)/2 * M**2))**((gamma+1)/(gamma-1))
+
+def dfM(AR, M, gamma):
+    g = 1 + (gamma-1)/2 * M**2
+    n = (gamma+1)/(gamma-1)
+    
+    return -(2/(gamma+1))**n * M**(-3) * g**(n-1) * (n*(gamma-1)*M**2 - 2*g)
+
+
+#vectorised Newton_raphson to find M_vals (written by Claude)
+def solve_mach(AR, gamma_int, r_vals, tol=1e-10, max_iter=50):
+    """
+    Vectorized Newton-Raphson solve for M(x) given area ratio AR(x) and gamma(x).
+    throat_index is taken as the index of minimum radius (M = 1 there).
+    """
+    
+    M = np.empty(N)
+
+    # --- branch masks ---
+    sub_mask = np.arange(N) < throat_index    # converging section, M < 1
+    sup_mask = np.arange(N) > throat_index     # diverging section, M > 1
+
+    # --- initial guesses, branch-aware ---
+    # subsonic: start modest and push down as AR grows
+    M[sub_mask] = np.clip(1 / AR[sub_mask], 0.05, 0.9)
+    # supersonic: start just above 1 and push up as AR grows
+    M[sup_mask] = np.clip(1.0 + 0.5 * np.log(AR[sup_mask]), 1.05, None)
+
+    # throat point(s) fixed exactly at 1
+    M[throat_index] = 1.0
+
+    # --- Newton iterations, vectorized over whole array at once ---
+    for _ in range(max_iter):
+        f  = fM(AR, M, gamma_int)
+        df = dfM(AR, M, gamma_int)
+
+        step = f / df
+        M_new = M - step
+
+        # keep each branch on its own side of M = 1 to avoid branch-jumping
+        M_new[sub_mask] = np.clip(M_new[sub_mask], 1e-6, 0.999999)
+        M_new[sup_mask] = np.clip(M_new[sup_mask], 1.000001, None)
+
+        delta = np.max(np.abs(M_new[~ (np.arange(N) == throat_index)]
+                               - M[~ (np.arange(N) == throat_index)]))
+
+        M = M_new
+        M[throat_index] = 1.0  # re-pin throat every iteration
+
+        if delta < tol:
+            break
+
+    return M
+
+
+# --- usage with your existing arrays ---
+# AR, gamma_int, r_vals already defined
+M_vals = solve_mach(AR, gamma_int, r_vals)
+#end of Claude code
+
+p_static = P_c / (1 + (gamma_int-1)/2 * M_vals**2)**(gamma_int/(gamma_int-1))   #computing static pressure values with axial position with M_vals
+
+
+#stress analysis
+dP = (p_regen - p_static)    #presure difference between regen and chamber (Pa) 
+E_hot_int = f_E(int_hot_wall_temp)   #E vals at hot_wall_temps, for thermal stresses
+E_avg_int = f_E(int_avg_wall_temp)  #E vals at avg_wall_temps
+
+
+YS_hot_vals = np.array([])         #creating the YS array for the N analysis segments, for the hot and avg wall temps
+YS_avg_vals = np.array([]) 
+for i in range(N):
+    YS_hot_vals = np.append(YS_hot_vals, f_YS(int_hot_wall_temp[i])) 
+    YS_avg_vals = np.append(YS_avg_vals, f_YS(int_avg_wall_temp[i])) 
+
+eta = f_E(np.full(N, 273.17))*t_outer / (f_E(np.full(N, 273.15))*t_outer + f_E(int_avg_wall_temp)*t)     #elastic restraint coeficent (more accurate assumption for the restiction of the inner wall against longitudonal thermal expantion, by including outer wall expantion)
+
+s_b = - dP/2 * ((lower_regen_widths-2*np.full(N, fillet_radius))/np.full(N, t))**2      #pressure bending stress (compressive), calculated at the hot gas side of the wall just before the fillet (as this is the maximum. However a more conservative estimate would not exclude the fillet radius from the width)
+s_t_b = - E_hot_int*a/(1-poisson) * (int_heat_flux*t/(2*k))       #compressive tangential thermal bending stress (given free avg expantion)
+s_t_m = - E_hot_int*a/(1-poisson) * (int_avg_wall_temp-273.15)    #compressive tangential thermal membrain stress of avg wall temp
+s_t_l = - eta * a * E_avg_int * (int_hot_wall_temp-int_cold_wall_temp)   #compressive thermal longitudonal stress (for now estimating hot_wall_temp-cold_wall_temp = avg_wall_temp - outer_wall_temp, which although is wrong, is suggested by the assumptions made in HH)
+
+s1 = s_b + s_t_b   #total tangiential stress
+s2 = s_t_l         #total longitudonal stress
+
+
+cbs = E_avg_int*t/(r_vals*np.sqrt(3*(1-poisson**2)))   #critical buckling stress (given by Huzzel and Huang)
+
+von_mises = np.sqrt(s1**2 - s1*s2 + s2**2)
+sf = YS_hot_vals / von_mises
+sf_b = cbs/np.sqrt(s2**2)
+
+
+stress_scale = 1e-6
+
+plt.figure()
+plt.plot(x_vals, -s_b * stress_scale, linewidth=2.2, label="Pressure bending stress")
+plt.plot(x_vals, -s_t_b * stress_scale, linewidth=2.2, label="Tangential thermal stress")
+plt.plot(x_vals, -s_t_l * stress_scale, linewidth=2.2, label="Longitudinal thermal stress")
+plt.plot(x_vals, YS_hot_vals * stress_scale, linewidth=2.2, label="Yeild stress")
+plt.title("Pressure and Thermal Stresses Along the Chamber")
+plt.xlabel("Axial distance from injector (m)")
+plt.ylabel("Stress (MPa)")
+plt.legend(loc="best", frameon=True)
+plt.grid(True, alpha=0.3)
+
+plt.figure()
+plt.plot(x_vals, sf, linewidth=2.2, label="Yield safety factor")
+plt.plot(x_vals, sf_b, linewidth=2.2, label="Buckling safety factor")
+plt.title("Yield and Buckling Safety Factors Along the Chamber")
+plt.xlabel("Axial distance from injector (m)")
+plt.ylabel("Safety factor (-)")
+plt.ylim(bottom=0.0)
+plt.legend(loc="best", frameon=True)
+plt.grid(True, alpha=0.3)
+
+
+plt.show()
+
+
+print('min SF', min(sf))
+
+
+
+
