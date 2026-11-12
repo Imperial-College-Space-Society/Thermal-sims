@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov  8 10:38:54 2026
+
+@author: jamessquire
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.sparse import coo_matrix
+from matplotlib.collections import PolyCollection
+from matplotlib.colors import Normalize
+
+colour_map = 'inferno'    #inferno, magma, plasma, viridis, cividis, hot, afmhot, gist_heat, coolwarm, RdBu_r, RdYlBu_r, seismic, bwr
+
+duration = 10 #duration s 
+dt = 0.0001 #timestep s 
+
+
+t = 0.7e-3     #chamber wall thickness m 
+h = 1e-3        #rib hight m 
+w =2e-3       #channel widrth m 
+w_r = 1e-3     #rib width m 
+o_t = 2e-3     #outer wall thickness m 
+r = 0.5e-3     #fillet radius m
+dz = 1e-3       #axial length m 
+
+T_c = 320      #coolant temp K
+T_h = 3000     #hot gass temp K
+T_initial = 300 #initial temps k 
+
+k = 150        #thermal conductivity of AlSi10Mg (Wk^-1m^-1)
+c = 900        #spesific heat capasity of AlSi10Mg J/(kgK)     
+rho = 2500     #density of AlSi10Mg (kg/m^3)
+cte = 22e-6    #coeficent of thermal expantion of AlSi10Mg K^-1
+rho_c = 735.65       #density of IPA (kg/m^3)
+c_c = 2912     #spesific heat capacity J/(kgK)
+k_c = 0.125         #thermal conductivity of IPA (Wk^-1m^-1)
+
+h_h = 3000        #core flow convective heat transfer coeficent 
+h_c = 13000        #regen convective heat transfer coeficent 
+
+temps = np.full(40, T_initial, dtype=float)     #temprature array 
+temps = np.append(temps, T_c)      #colant temp in index 40
+temps = np.append(temps, T_h)      #core gas temp in index 41
+
+
+radial_extention = r*(1-np.sqrt(2)/2)                  #extention to inside rib chamber wall segments (to extend corner segment to the rib fillet surface)
+w_eff = w - 2*radial_extention
+h_eff = h - 2*radial_extention
+#spesific segment dimentions
+w1 = w_eff/4
+h1 = h_eff/4
+t1 = t/4
+o_t1 = o_t/4
+w_r1 = w_r/4 + radial_extention
+w_r2 = w_r/4 
+
+def fillet_hight(x): 
+    if x <= r-radial_extention:
+        return r - np.sqrt(r**2-(r-radial_extention-x)**2)  #hight added by the fillet as a function of distance away from the corner segment
+    elif x > r-radial_extention:
+        return 0
+
+def fillet_length(x):  #length of fillet segment arcs 
+    if r == 0:
+        return 0.0
+    return r*(np.arcsin((r-radial_extention)/r)-np.arcsin((r-radial_extention-x)/r))
+
+def fillet_area(x):  #Area of fillet segments 
+    if r == 0:
+        return 0.0
+    return r*x - (r-radial_extention)/2 * np.sqrt(r**2-(r-radial_extention)**2) + (r-radial_extention-x)/2 * np.sqrt(r**2-(r-radial_extention-x)**2) - (r**2)/2 * (np.arcsin((r-radial_extention)/r)-np.arcsin((r-radial_extention-x)/r))
+
+
+#calculating areas and volumes of segments adjacent to coolant channel
+A_seg = np.zeros((8))
+m_seg = np.zeros((8))
+remainder_w = w1 - (r - radial_extention)
+remainder_h = h1 - (r - radial_extention)
+
+if remainder_w >= 0:
+    A_seg[0] = w1 * dz
+    A_seg[1] = (1/8 * 2*np.pi*r + remainder_w) * dz
+    A_seg[6] = (1/8 * 2*np.pi*r + remainder_w) * dz
+    A_seg[7] = w1 * dz
+    m_seg[0] = w1 * t1 * dz * rho
+    m_seg[1] = (w1 * t1 + fillet_area(r-radial_extention)) * dz * rho
+    m_seg[6] = (w1 * o_t1 + fillet_area(r-radial_extention)) * dz * rho
+    m_seg[7] = w1 * o_t1 * dz * rho
+elif remainder_w < 0:
+    A_seg[0] = ((1/8 * 2*np.pi*r - fillet_length(w1)) + (w/2 - r)) * dz
+    A_seg[1] = fillet_length(w1) * dz
+    A_seg[6] = fillet_length(w1) * dz
+    A_seg[7] = ((1/8 * 2*np.pi*r - fillet_length(w1)) + (w/2 - r)) * dz
+    m_seg[0] = (w1 * t1 + (fillet_area(r-radial_extention)-fillet_area(w1))) * dz * rho
+    m_seg[1] = (w1 * t1 + fillet_area(w1)) * dz * rho
+    m_seg[6] = (w1 * o_t1 + fillet_area(w1)) * dz * rho
+    m_seg[7] = (w1 * o_t1 + (fillet_area(r-radial_extention)-fillet_area(w1))) * dz * rho
+    
+if remainder_h >= 0:
+    A_seg[2] = (1/8 * 2*np.pi*r + remainder_h) * dz
+    A_seg[3] = h1 * dz
+    A_seg[4] = h1 * dz
+    A_seg[5] = (1/8 * 2*np.pi*r + remainder_h) * dz
+    m_seg[2] = (h1 * w_r2 + fillet_area(r-radial_extention)) * dz * rho
+    m_seg[3] = h1 * w_r2 * dz * rho
+    m_seg[4] = h1 * w_r2 * dz * rho
+    m_seg[5] = (h1 * w_r2 + fillet_area(r-radial_extention)) * dz * rho
+elif remainder_h < 0:
+    A_seg[2] = fillet_length(h1) * dz
+    A_seg[3] = ((1/8 * 2*np.pi*r - fillet_length(h1)) + (h/2 - r)) * dz
+    A_seg[4] = ((1/8 * 2*np.pi*r - fillet_length(h1)) + (h/2 - r)) * dz
+    A_seg[5] = fillet_length(h1) * dz
+    m_seg[2] = (h1 * w_r2 + fillet_area(h1)) * dz * rho
+    m_seg[3] = (h1 * w_r2 + (fillet_area(r-radial_extention) - fillet_area(h1))) * dz * rho
+    m_seg[4] = (h1 * w_r2 + (fillet_area(r-radial_extention) - fillet_area(h1))) * dz * rho
+    m_seg[5] = (h1 * w_r2 + fillet_area(h1)) * dz * rho
+
+
+#convective heat flux coeficents for segments adjacent to fluid (in temp change, to be put straight into A)
+def dT_conv(A, m, h_spesific):
+    dx = m/(rho*A)
+    h_Eff = 1/(1/h_spesific + dx/(2*k))     #linear extrapolation correction for difference between surface and node temp 
+    return A*h_Eff*dt/(m*c)
+
+def dT_coolant(A, m):                 #convective heat flux coeficents for coolant  
+    dx = m/(rho*A)    
+    m_coolant = (h*w/2 - 1/2 * (4*r**2-np.pi*r**2))*dz*rho_c  
+    h_Eff = 1/(1/h_c + dx/(2*k))               
+    return A*h_Eff*dt/(m_coolant*c_c)
+
+
+conv_seg = np.zeros((12))
+conv_coolant = np.zeros((8))
+conv_seg[0] = dT_conv(w1*dz, w1*dz*t1*rho, h_h)
+conv_seg[1] = dT_conv(w1*dz, w1*dz*t1*rho, h_h)
+conv_seg[2] = dT_conv(w_r1*dz, w_r1*dz*t1*rho, h_h)
+conv_seg[3] = dT_conv(w_r2*dz, w_r2*dz*t1*rho, h_h)
+
+for i in range(8):
+    conv_seg[i+4] = dT_conv(A_seg[i], m_seg[i], h_c)
+    conv_coolant[i] = dT_coolant(A_seg[i], m_seg[i])
+
+
+#segment side lengths
+left = np.zeros((40))
+right = np.zeros((40))
+top = np.zeros((40))
+bottom = np.zeros((40))
+
+for i in range(6):
+    left[i], right[i], top[i], bottom[i] = t1, t1, w1, w1
+    
+for i in range(3):
+    left[i+6], right[i+6], top[i+6], bottom[i+6] = t1, t1, w_r1, w_r1
+    
+for i in range(3):
+    left[i+9], right[i+9], top[i+9], bottom[i+9] = t1, t1, w_r2, w_r2 
+    
+#although some of these values aren't physical for these non-rectangual segments it required to make constructing mean spacing easier later
+left[12], right[12], top[12], bottom[12] = t1, t1+fillet_hight(w1), w1, w1 
+left[13], right[13], top[13], bottom[13] = t1+fillet_hight(w1), t1+radial_extention, w1, w1
+
+left[14], right[14], top[14], bottom[14] = h1, h1, w_r2+fillet_hight(h1), w_r1
+left[15], right[15], top[15], bottom[15] = h1, h1, w_r2, w_r2+fillet_hight(h1)
+left[16], right[16], top[16], bottom[16] = h1, h1, w_r2+fillet_hight(h1), w_r2 
+left[17], right[17], top[17], bottom[17] = h1, h1, w_r1, w_r2+fillet_hight(h1) 
+
+left[18], right[18], top[18], bottom[18] = o_t1+fillet_hight(w1), o_t1+radial_extention, w1, w1
+left[19], right[19], top[19], bottom[19] = o_t1, o_t1+fillet_hight(w1), w1, w1
+
+
+left[20], right[20], top[20], bottom[20] = t1+radial_extention, t1+radial_extention, w_r1, w_r1
+left[21], right[21], top[21], bottom[21] = t1+radial_extention, t1+radial_extention, w_r2, w_r2
+
+for i in range(4):
+    left[i+22], right[i+22], top[i+22], bottom[i+22] = h1, h1, w_r2, w_r2
+
+left[26], right[26], top[26], bottom[26] = o_t1+radial_extention, o_t1+radial_extention, w_r2, w_r2
+left[27], right[27], top[27], bottom[27] = o_t1+radial_extention, o_t1+radial_extention, w_r1, w_r1
+
+
+for i in range(3):
+    left[i+28], right[i+28], top[i+28], bottom[i+28] = o_t1, o_t1, w_r2, w_r2 
+
+for i in range(3):
+    left[i+31], right[i+31], top[i+31], bottom[i+31] = o_t1, o_t1, w_r1, w_r1 
+
+for i in range(6):
+    left[i+34], right[i+34], top[i+34], bottom[i+34] = o_t1, o_t1, w1, w1
+    
+
+#segment slice areas and volume 
+seg_slice_area = np.zeros((40))
+for i in range(12):
+    seg_slice_area[i] = left[i]*top[i]
+
+for i in range(8):
+    seg_slice_area[i+12] = m_seg[i]/(dz*rho)
+
+for i in range(20):
+    seg_slice_area[i+20] = left[i+20]*top[i+20]
+    
+vol = seg_slice_area*dz
+
+#mean thickness of segments adjacent to coolant channel, normal to directio of flux into coolant (then converted into the mean segment spacing used for condution)
+widths = np.array([w1,w1,h1,h1,h1,h1,w1,w1])
+mean_thickness = m_seg/(rho*dz*widths)
+dx_ad = np.zeros((8))
+dx_ad[0] = (mean_thickness[0]+t1)/2
+dx_ad[1] = (mean_thickness[1]+t1)/2
+for i in range(4):
+    dx_ad[i+2] = (mean_thickness[i+2]+w_r2)/2
+dx_ad[6] = (mean_thickness[6]+o_t1)/2
+dx_ad[7] = (mean_thickness[7]+o_t1)/2
+
+#conection of segments (which cell neigbours which other cells)
+c_s = np.full((5,40), -1, dtype=int) 
+
+c_s[0,0], c_s[1,0] = 1, 3
+c_s[0,1], c_s[1,1], c_s[2,1] = 2, 4, 0
+c_s[0,2], c_s[1,2], c_s[2,2] = 12, 5, 1
+c_s[0,3], c_s[1,3], c_s[3,3] = 4, 6, 0
+c_s[0,4], c_s[1,4], c_s[2,4], c_s[3,4] = 5, 7, 3, 1
+c_s[0,5], c_s[1,5], c_s[2,5], c_s[3,5] = 13, 8, 4, 2
+c_s[0,6], c_s[1,6], c_s[3,6] = 7, 9, 3
+c_s[0,7], c_s[1,7], c_s[2,7], c_s[3,7] = 8, 10, 6, 4
+c_s[0,8], c_s[1,8], c_s[2,8], c_s[3,8] = 20, 11, 7, 5
+c_s[0,9], c_s[3,9] = 10, 6
+c_s[0,10], c_s[2,10], c_s[3,10] = 11, 9, 7
+c_s[0,11], c_s[2,11], c_s[3,11] = 21, 10, 8
+
+c_s[1,12], c_s[2,12] = 13, 2
+c_s[1,13], c_s[2,13], c_s[3,13] = 20, 5, 12
+c_s[0,14], c_s[1,14], c_s[2,14] = 15, 22, 20
+c_s[0,15], c_s[1,15], c_s[2,15] = 16, 23, 14
+c_s[0,16], c_s[1,16], c_s[2,16] = 17, 24, 15
+c_s[0,17], c_s[1,17], c_s[2,17] = 27, 25, 16
+c_s[0,18], c_s[1,18], c_s[3,18] = 34, 27, 19
+c_s[0,19], c_s[1,19] = 37, 18
+
+c_s[0,20], c_s[1,20], c_s[2,20], c_s[3,20] = 14, 21, 8, 13
+c_s[0,21], c_s[2,21], c_s[3,21] = 22, 11, 20
+c_s[0,22], c_s[2,22], c_s[3,22] = 23, 21, 14
+c_s[0,23], c_s[2,23], c_s[3,23] = 24, 22, 15
+c_s[0,24], c_s[2,24], c_s[3,24] = 25, 23, 16
+c_s[0,25], c_s[2,25], c_s[3,25] = 26, 24, 17
+c_s[0,26], c_s[2,26], c_s[3,26] = 28, 25, 27
+c_s[0,27], c_s[1,27], c_s[2,27], c_s[3,27] = 31, 26, 17, 18
+c_s[0,28], c_s[2,28], c_s[3,28] = 29, 26, 31
+c_s[0,29], c_s[2,29], c_s[3,29] = 30, 28, 32
+c_s[2,30], c_s[3,30] = 29, 33
+c_s[0,31], c_s[1,31], c_s[2,31], c_s[3,31] = 32, 28, 27, 34
+c_s[0,32], c_s[1,32], c_s[2,32], c_s[3,32] = 33, 29, 31, 35
+c_s[1,33], c_s[2,33], c_s[3,33] = 30, 32, 36
+c_s[0,34], c_s[1,34], c_s[2,34], c_s[3,34] = 35, 31, 18, 37
+c_s[0,35], c_s[1,35], c_s[2,35], c_s[3,35] = 36, 32, 34, 38
+c_s[1,36], c_s[2,36], c_s[3,36] = 33, 35, 39
+c_s[0,37], c_s[1,37], c_s[2,37] = 38, 34, 19
+c_s[0,38], c_s[1,38], c_s[2,38] = 39, 35, 37
+c_s[1,39], c_s[2,39] = 36, 38
+
+#mean spacing used for each conduction pathway
+spacing = np.zeros((4,40))
+faces = [top, right, bottom, left] 
+for i in range(4):
+    has = c_s[i] >=0
+    spacing[i, has] = (faces[i-1][has]+faces[i-1][c_s[i,has]])/2
+        
+#correcting for non-uniform widths and hights of non rectangular segments (using dx_ad created earlier)
+for a, d, b, e, dx in [(2,0,12,2,dx_ad[0]), (5,0,13,2,dx_ad[1]), (14,1,22,3,dx_ad[2]), (15,1,23,3,dx_ad[3]), (16,1,24,3,dx_ad[4]), (17,1,25,3,dx_ad[5]), (18,0,34,2,dx_ad[6]), (19,0,37,2,dx_ad[7])]:
+    spacing[d,a] = spacing[e,b] = dx
+
+
+#fourier number (x and y are the sides of the face being analysed)
+def F(A, V, dx):                  
+    m = V*rho
+    return k*dt*A/(m*c*dx) 
+    
+F_0 = np.zeros((5,40))   #array of fouier numbers (row gives direction: 0=up, 1=right, 2=down, 3=left, 4=axial)
+
+#axial conductive heat transfer coeficents 
+for i in range(12):
+    F_0[4,i] = F(seg_slice_area[i], seg_slice_area[i]*dz, dz)
+
+for i in range(8):
+    F_0[4,i+12] = F(seg_slice_area[i+12], seg_slice_area[i+12]*dz, dz)
+
+for i in range(20):
+    F_0[4,i+20] = F(seg_slice_area[i+20], seg_slice_area[i+20]*dz, dz)
+
+#radial and tangential conductive heat transfer coeficents 
+for i in range(4):
+    has = spacing[i] > 0
+    F_0[i, has] = k*dt*(faces[i][has]*dz) / (rho*c*vol[has]*spacing[i, has])
+
+    
+#creating coeficent matrix rows cols and vals (used to form the matrix) 
+rows = []
+cols = []
+vals = []
+
+#segment 0 
+rows += np.full(4, 0).tolist()
+cols += [0, 1, 3, 41]
+vals += [1-F_0[0,0]-F_0[1,0]-conv_seg[0], F_0[0,0], F_0[1,0], conv_seg[0]]
+
+#segment 1 
+rows += np.full(4, 1).tolist()
+cols += [1, 2, 4, 0]
+vals += [1-F_0[0,1]-F_0[1,1]-F_0[2,1], F_0[0,1], F_0[1,1], F_0[2,1]]
+
+#segment 2 (etc...)
+rows += np.full(4, 2).tolist()
+cols += [2, 12, 5, 1]
+vals += [1-F_0[0,2]-F_0[1,2]-F_0[2,2], F_0[0,2], F_0[1,2], F_0[2,2]]
+
+rows += np.full(5, 3).tolist()
+cols += [3, 4, 6, 0, 41]
+vals += [1-F_0[0,3]-F_0[1,3]-F_0[3,3]-conv_seg[1], F_0[0,3], F_0[1,3], F_0[3,3], conv_seg[1]]
+
+
+rows += np.full(5, 4).tolist()
+cols += [4, 5, 7, 3, 1]
+vals += [1-F_0[0,4]-F_0[1,4]-F_0[2,4]-F_0[3,4], F_0[0,4], F_0[1,4], F_0[2,4], F_0[3,4]]
+
+rows += np.full(5, 5).tolist()
+cols += [5, 13, 8, 4, 2]
+vals += [1-F_0[0,5]-F_0[1,5]-F_0[2,5]-F_0[3,5], F_0[0,5], F_0[1,5], F_0[2,5], F_0[3,5]]
+
+rows += np.full(5, 6).tolist()
+cols += [6, 7, 9, 3, 41]
+vals += [1-F_0[0,6]-F_0[1,6]-F_0[3,6]-conv_seg[2], F_0[0,6], F_0[1,6], F_0[3,6], conv_seg[2]]
+
+rows += np.full(5, 7).tolist()
+cols += [7, 8, 10, 6, 4]
+vals += [1-F_0[0,7]-F_0[1,7]-F_0[2,7]-F_0[3,7], F_0[0,7], F_0[1,7], F_0[2,7], F_0[3,7]]
+
+rows += np.full(5, 8).tolist()
+cols += [8, 20, 11, 7, 5]
+vals += [1-F_0[0,8]-F_0[1,8]-F_0[2,8]-F_0[3,8], F_0[0,8], F_0[1,8], F_0[2,8], F_0[3,8]]
+
+
+rows += np.full(4, 9).tolist()
+cols += [9, 10, 6, 41]
+vals += [1-F_0[0,9]-F_0[3,9]-conv_seg[3], F_0[0,9], F_0[3,9], conv_seg[3]]
+
+rows += np.full(4, 10).tolist()
+cols += [10, 11, 9, 7]
+vals += [1-F_0[0,10]-F_0[2,10]-F_0[3,10], F_0[0,10], F_0[2,10], F_0[3,10]]
+
+rows += np.full(4, 11).tolist()
+cols += [11, 21, 10, 8]
+vals += [1-F_0[0,11]-F_0[2,11]-F_0[3,11], F_0[0,11], F_0[2,11], F_0[3,11]]
+
+
+rows += np.full(4, 12).tolist()
+cols += [12, 13, 2, 40]
+vals += [1-F_0[1,12]-F_0[2,12]-conv_seg[4], F_0[1,12], F_0[2,12], conv_seg[4]]
+
+rows += np.full(5, 13).tolist()
+cols += [13, 20, 5, 12, 40]
+vals += [1-F_0[1,13]-F_0[2,13]-F_0[3,13]-conv_seg[5], F_0[1,13], F_0[2,13], F_0[3,13], conv_seg[5]]
+
+rows += np.full(5, 14).tolist()
+cols += [14, 15, 22, 20, 40]
+vals += [1-F_0[0,14]-F_0[1,14]-F_0[2,14]-conv_seg[6], F_0[0,14], F_0[1,14], F_0[2,14], conv_seg[6]]
+
+rows += np.full(5, 15).tolist()
+cols += [15, 16, 23, 14, 40]
+vals += [1-F_0[0,15]-F_0[1,15]-F_0[2,15]-conv_seg[7], F_0[0,15], F_0[1,15], F_0[2,15], conv_seg[7]]
+
+rows += np.full(5, 16).tolist()
+cols += [16, 17, 24, 15, 40]
+vals += [1-F_0[0,16]-F_0[1,16]-F_0[2,16]-conv_seg[8], F_0[0,16], F_0[1,16], F_0[2,16], conv_seg[8]]
+
+rows += np.full(5, 17).tolist()
+cols += [17, 27, 25, 16, 40]
+vals += [1-F_0[0,17]-F_0[1,17]-F_0[2,17]-conv_seg[9], F_0[0,17], F_0[1,17], F_0[2,17], conv_seg[9]]
+
+rows += np.full(5, 18).tolist()
+cols += [18, 34, 27, 19, 40]
+vals += [1-F_0[0,18]-F_0[1,18]-F_0[3,18]-conv_seg[10], F_0[0,18], F_0[1,18], F_0[3,18], conv_seg[10]]
+
+rows += np.full(4, 19).tolist()
+cols += [19, 37, 18, 40]
+vals += [1-F_0[0,19]-F_0[1,19]-conv_seg[11], F_0[0,19], F_0[1,19], conv_seg[11]]
+
+
+rows += np.full(5, 20).tolist()
+cols += [20, 14, 21, 8, 13]
+vals += [1-F_0[0,20]-F_0[1,20]-F_0[2,20]-F_0[3,20], F_0[0,20], F_0[1,20], F_0[2,20], F_0[3,20]]
+
+rows += np.full(4, 21).tolist()
+cols += [21, 22, 11, 20]
+vals += [1-F_0[0,21]-F_0[2,21]-F_0[3,21], F_0[0,21], F_0[2,21], F_0[3,21]]
+
+rows += np.full(4, 22).tolist()
+cols += [22, 23, 21, 14]
+vals += [1-F_0[0,22]-F_0[2,22]-F_0[3,22], F_0[0,22], F_0[2,22], F_0[3,22]]
+
+rows += np.full(4, 23).tolist()
+cols += [23, 24, 22, 15]
+vals += [1-F_0[0,23]-F_0[2,23]-F_0[3,23], F_0[0,23], F_0[2,23], F_0[3,23]]
+
+rows += np.full(4, 24).tolist()
+cols += [24, 25, 23, 16]
+vals += [1-F_0[0,24]-F_0[2,24]-F_0[3,24], F_0[0,24], F_0[2,24], F_0[3,24]]
+
+rows += np.full(4, 25).tolist()
+cols += [25, 26, 24, 17]
+vals += [1-F_0[0,25]-F_0[2,25]-F_0[3,25], F_0[0,25], F_0[2,25], F_0[3,25]]
+
+rows += np.full(4, 26).tolist()
+cols += [26, 28, 25, 27]
+vals += [1-F_0[0,26]-F_0[2,26]-F_0[3,26], F_0[0,26], F_0[2,26], F_0[3,26]]
+
+
+rows += np.full(5, 27).tolist()
+cols += [27, 31, 26, 17, 18]
+vals += [1-F_0[0,27]-F_0[1,27]-F_0[2,27]-F_0[3,27], F_0[0,27], F_0[1,27], F_0[2,27], F_0[3,27]]
+
+rows += np.full(4, 28).tolist()
+cols += [28, 29, 26, 31]
+vals += [1-F_0[0,28]-F_0[2,28]-F_0[3,28], F_0[0,28], F_0[2,28], F_0[3,28]]
+
+rows += np.full(4, 29).tolist()
+cols += [29, 30, 28, 32]
+vals += [1-F_0[0,29]-F_0[2,29]-F_0[3,29], F_0[0,29], F_0[2,29], F_0[3,29]]
+
+rows += np.full(3, 30).tolist()
+cols += [30, 29, 33]
+vals += [1-F_0[2,30]-F_0[3,30], F_0[2,30], F_0[3,30]]
+
+
+rows += np.full(5, 31).tolist()
+cols += [31, 32, 28, 27, 34]
+vals += [1-F_0[0,31]-F_0[1,31]-F_0[2,31]-F_0[3,31], F_0[0,31], F_0[1,31], F_0[2,31], F_0[3,31]]
+
+rows += np.full(5, 32).tolist()
+cols += [32, 33, 29, 31, 35]
+vals += [1-F_0[0,32]-F_0[1,32]-F_0[2,32]-F_0[3,32], F_0[0,32], F_0[1,32], F_0[2,32], F_0[3,32]]
+
+rows += np.full(4, 33).tolist()
+cols += [33, 30, 32, 36]
+vals += [1-F_0[1,33]-F_0[2,33]-F_0[3,33], F_0[1,33], F_0[2,33], F_0[3,33]]
+
+
+rows += np.full(5, 34).tolist()
+cols += [34, 35, 31, 18, 37]
+vals += [1-F_0[0,34]-F_0[1,34]-F_0[2,34]-F_0[3,34], F_0[0,34], F_0[1,34], F_0[2,34], F_0[3,34]]
+
+rows += np.full(5, 35).tolist()
+cols += [35, 36, 32, 34, 38]
+vals += [1-F_0[0,35]-F_0[1,35]-F_0[2,35]-F_0[3,35], F_0[0,35], F_0[1,35], F_0[2,35], F_0[3,35]]
+
+rows += np.full(4, 36).tolist()
+cols += [36, 33, 35, 39]
+vals += [1-F_0[1,36]-F_0[2,36]-F_0[3,36], F_0[1,36], F_0[2,36], F_0[3,36]]
+
+
+rows += np.full(4, 37).tolist()
+cols += [37, 38, 34, 19]
+vals += [1-F_0[0,37]-F_0[1,37]-F_0[2,37], F_0[0,37], F_0[1,37], F_0[2,37]]
+
+rows += np.full(4, 38).tolist()
+cols += [38, 39, 35, 37]
+vals += [1-F_0[0,38]-F_0[1,38]-F_0[2,38], F_0[0,38], F_0[1,38], F_0[2,38]]
+
+rows += np.full(3, 39).tolist()
+cols += [39, 36, 38]
+vals += [1-F_0[1,39]-F_0[2,39], F_0[1,39], F_0[2,39]]
+
+
+rows += [40, 40, 40, 40, 40, 40, 40, 40, 40, 41]
+cols += [40, 12, 13, 14, 15, 16, 17, 18, 19, 41]
+vals += [1-np.sum(conv_coolant), conv_coolant[0], conv_coolant[1], conv_coolant[2], conv_coolant[3], conv_coolant[4], conv_coolant[5], conv_coolant[6], conv_coolant[7], 1]
+
+
+#coefficent matrix
+A = coo_matrix((vals, (rows, cols)), shape=(42, 42)).tocsr()
+
+
+dcT = []
+
+for i in range(round(duration/dt)):
+    temps = A @ temps 
+    dcT.append(temps[40]-T_c)
+    temps[40] = T_c
+    
+
+#stability check
+diagonal = A.diagonal()[:41]
+print(min(diagonal))
+print(diagonal)
+print('max dcT', max(dcT))
+
+plt.plot(np.linspace(0, duration, round(duration/dt)), dcT)
+
+
+
+##Claude plotting temps on a heat map
+# ============================================================
+# 2D TEMPERATURE HEAT MAP
+# ============================================================
+
+# Physical node temperatures only
+T = temps[:40]
+
+# Store polygons and corresponding temperatures
+polygons = []
+temperatures = []
+node_numbers = []
+node_centres = []
+
+
+# Function to find the centroid of a polygon (used for the node labels)
+def polygon_centroid(pts):
+
+    x = np.array([p[0] for p in pts])
+    y = np.array([p[1] for p in pts])
+    x2 = np.roll(x, -1)
+    y2 = np.roll(y, -1)
+
+    cross = x*y2 - x2*y
+    area = cross.sum()/2
+
+    cx = ((x + x2)*cross).sum()/(6*area)
+    cy = ((y + y2)*cross).sum()/(6*area)
+
+    return (cx, cy)
+
+
+# Function to create any thermal node from a list of corner points
+def add_poly(node, pts):
+
+    polygons.append(pts)
+
+    temperatures.append(T[node])
+
+    node_numbers.append(node)
+
+    node_centres.append(polygon_centroid(pts))
+
+
+# Function to create rectangular thermal nodes
+def add_node(node, x1, x2, y1, y2):
+
+    add_poly(node, [
+        (x1, y1),
+        (x2, y1),
+        (x2, y2),
+        (x1, y2)
+    ])
+
+
+# ============================================================
+# FILLET GEOMETRY
+# ============================================================
+
+x_cl = w/2 - r        # x where the fillet arcs meet the flat floor / ceiling
+
+# column edges (x): A = channel centre side, D = rib centre
+xA, xB, xC, xD, xE = 0, w1, 2*w1, w/2 + w_r/4, w/2 + w_r/2
+
+# floor surface height as a function of x (flat, then fillet arc up to the rib)
+def floor_y(x):
+    dx = np.maximum(x - x_cl, 0)
+    return t + r - np.sqrt(np.maximum(r**2 - dx**2, 0))
+
+# ceiling surface height as a function of x (flat, then fillet arc down to the rib)
+def ceil_y(x):
+    dx = np.maximum(x - x_cl, 0)
+    return t + h - r + np.sqrt(np.maximum(r**2 - dx**2, 0))
+
+# rib face position as a function of y (lower arc, flat face, upper arc)
+def rib_x(y):
+    dy = np.where(y < t + r, y - (t + r),
+         np.where(y > t + h - r, y - (t + h - r), 0))
+    return x_cl + np.sqrt(np.maximum(r**2 - dy**2, 0))
+
+# node whose top edge follows the floor fillet (nodes 12, 13)
+def add_floor_node(node, xa, xb):
+    pts = [(xa, 3*t1), (xb, 3*t1)]
+    pts += [(x, floor_y(x)) for x in np.linspace(xb, xa, 20)]
+    add_poly(node, pts)
+
+# node whose bottom edge follows the ceiling fillet (nodes 18, 19)
+def add_ceiling_node(node, xa, xb):
+    y_top = t + h + o_t1
+    pts = [(xa, y_top), (xb, y_top)]
+    pts += [(x, ceil_y(x)) for x in np.linspace(xb, xa, 20)]
+    add_poly(node, pts)
+
+# node whose left edge follows the rib fillet (nodes 14 to 17)
+def add_rib_fillet_node(node, y1, y2):
+    pts = [(xD, y1), (xD, y2)]
+    pts += [(rib_x(y), y) for y in np.linspace(y2, y1, 20)]
+    add_poly(node, pts)
+
+
+# ============================================================
+# CHAMBER WALL
+# ============================================================
+
+# Nodes 0-11: three layers in each of the four columns (A, B, C, D)
+
+columns = [(xA, xB), (xB, xC), (xC, xD), (xD, xE)]
+
+for c_i, (xa, xb) in enumerate(columns):
+
+    for i in range(3):
+
+        add_node(
+            node=3*c_i + i,
+            x1=xa,
+            x2=xb,
+            y1=i*t1,
+            y2=(i+1)*t1
+        )
+
+
+# Nodes 12, 13: fourth layer beneath the channel (follows the floor fillet)
+
+add_floor_node(12, xA, xB)
+add_floor_node(13, xB, xC)
+
+
+# Nodes 20, 21: fourth layer beneath the rib
+
+add_node(node=20, x1=xC, x2=xD, y1=3*t1, y2=t+radial_extention)
+add_node(node=21, x1=xD, x2=xE, y1=3*t1, y2=t+radial_extention)
+
+
+# ============================================================
+# RIB
+# ============================================================
+
+# Nodes 14-17: rib segments adjacent to the coolant (follow the rib fillets)
+
+for i in range(4):
+
+    add_rib_fillet_node(
+        node=14+i,
+        y1=t+radial_extention+i*h1,
+        y2=t+radial_extention+(i+1)*h1
+    )
+
+
+# Nodes 22-25: rib segments at the rib centre
+
+for i in range(4):
+
+    add_node(
+        node=22+i,
+        x1=xD,
+        x2=xE,
+        y1=t+radial_extention+i*h1,
+        y2=t+radial_extention+(i+1)*h1
+    )
+
+
+# ============================================================
+# OUTER WALL
+# ============================================================
+
+# Nodes 18, 19: first layer above the channel (follows the ceiling fillet)
+
+add_ceiling_node(18, xB, xC)
+add_ceiling_node(19, xA, xB)
+
+
+# Nodes 27, 26: first layer above the rib
+
+add_node(node=27, x1=xC, x2=xD, y1=t+h-radial_extention, y2=t+h+o_t1)
+add_node(node=26, x1=xD, x2=xE, y1=t+h-radial_extention, y2=t+h+o_t1)
+
+
+# Nodes 28-39: remaining three layers in each column
+
+outer_nodes = [(xD, xE, 28), (xC, xD, 31), (xB, xC, 34), (xA, xB, 37)]
+
+for xa, xb, first_node in outer_nodes:
+
+    for j in range(3):
+
+        add_node(
+            node=first_node+j,
+            x1=xa,
+            x2=xb,
+            y1=t+h+o_t1+j*o_t1,
+            y2=t+h+o_t1+(j+1)*o_t1
+        )
+
+
+# ============================================================
+# COOLANT CHANNEL
+# ============================================================
+
+theta_lower = np.linspace(-np.pi/2, 0, 20)
+theta_upper = np.linspace(0, np.pi/2, 20)
+
+coolant_polygon = [(0, t)]
+coolant_polygon += [(x_cl + r*np.cos(a), t + r + r*np.sin(a)) for a in theta_lower]
+coolant_polygon += [(x_cl + r*np.cos(a), t + h - r + r*np.sin(a)) for a in theta_upper]
+coolant_polygon += [(0, t + h)]
+
+polygons.append(coolant_polygon)
+
+temperatures.append(temps[40])
+
+
+# ============================================================
+# CREATE HEAT MAP
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(6, 9))
+
+# Temperature colour scale
+norm = Normalize(
+    vmin=min(np.min(T), temps[40]),
+    vmax=max(np.max(T), temps[40])
+)
+
+# Create coloured polygons
+collection = PolyCollection(
+    polygons,
+    array=np.array(temperatures),
+    cmap=colour_map,
+    norm=norm,
+    edgecolors="black",
+    linewidths=0.5
+)
+
+ax.add_collection(collection)
+
+
+# ============================================================
+# NODE LABELS
+# ============================================================
+
+for node, (x, y) in zip(node_numbers, node_centres):
+
+    ax.text(
+        x,
+        y,
+        f"{T[node]:.0f}",
+        ha="center",
+        va="center",
+        fontsize=7,
+        color="black",
+        fontweight="bold"
+    )
+
+# ============================================================
+# AXES AND FORMATTING
+# ============================================================
+
+ax.set_xlim(0, w/2 + w_r/2)
+
+ax.set_ylim(0, t+h+o_t)
+
+# Convert axis display from metres to millimetres
+from matplotlib.ticker import FuncFormatter
+
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda x, pos: f"{x*1000:.1f}")
+)
+
+ax.yaxis.set_major_formatter(
+    FuncFormatter(lambda y, pos: f"{y*1000:.1f}")
+)
+
+ax.set_xlabel("Width (mm)")
+ax.set_ylabel("Height (mm)")
+
+ax.set_title(
+    f"Chamber Wall Temperature Distribution\n"
+    f"Time = {duration:.2f} s"
+)
+
+ax.set_aspect("equal")
+
+# Colour bar
+cbar = fig.colorbar(collection, ax=ax)
+
+cbar.set_label("Temperature (K)")
+
+plt.tight_layout()
+
+plt.show()
+
+
+
+
